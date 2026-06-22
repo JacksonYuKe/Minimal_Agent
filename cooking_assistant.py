@@ -65,6 +65,89 @@ def suggest_recipe(ingredients):
 
     return results
 
+
+def estimate_nutrition(ingredients):
+    """Estimate nutrition using a typical serving size for each ingredient."""
+    nutrition_data = {
+        "chicken": {
+            "serving": "100 g cooked chicken breast",
+            "calories": 165,
+            "protein_g": 31,
+            "carbs_g": 0,
+            "fat_g": 3.6
+        },
+        "rice": {
+            "serving": "1 cup cooked rice",
+            "calories": 205,
+            "protein_g": 4.3,
+            "carbs_g": 44.5,
+            "fat_g": 0.4
+        },
+        "egg": {
+            "serving": "1 large egg",
+            "calories": 72,
+            "protein_g": 6.3,
+            "carbs_g": 0.4,
+            "fat_g": 4.8
+        },
+        "onion": {
+            "serving": "1 medium onion",
+            "calories": 44,
+            "protein_g": 1.2,
+            "carbs_g": 10.3,
+            "fat_g": 0.1
+        },
+        "tomato": {
+            "serving": "1 medium tomato",
+            "calories": 22,
+            "protein_g": 1.1,
+            "carbs_g": 4.8,
+            "fat_g": 0.2
+        },
+        "noodles": {
+            "serving": "1 cup cooked noodles",
+            "calories": 221,
+            "protein_g": 8.1,
+            "carbs_g": 40.3,
+            "fat_g": 3.3
+        }
+    }
+
+    items = []
+    unknown_ingredients = []
+    totals = {
+        "calories": 0,
+        "protein_g": 0,
+        "carbs_g": 0,
+        "fat_g": 0
+    }
+
+    for ingredient in ingredients:
+        normalized_ingredient = ingredient.strip().lower()
+        nutrition = nutrition_data.get(normalized_ingredient)
+
+        if nutrition is None:
+            unknown_ingredients.append(ingredient)
+            continue
+
+        items.append({
+            "ingredient": ingredient,
+            **nutrition
+        })
+
+        for nutrient in totals:
+            totals[nutrient] += nutrition[nutrient]
+
+    return {
+        "note": "Estimates use one typical serving of each ingredient and may vary by product and preparation method.",
+        "items": items,
+        "estimated_total": {
+            nutrient: round(value, 1)
+            for nutrient, value in totals.items()
+        },
+        "unknown_ingredients": unknown_ingredients
+    }
+
 tools = [
     {
         "type": "function",
@@ -91,9 +174,33 @@ tools = [
                 "required": ["ingredients"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "estimate_nutrition",
+            "description": "Estimate calories and macronutrients for a list of ingredients using typical serving sizes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ingredients": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Ingredients to estimate nutrition for, such as chicken, rice, egg, or tomato."
+                    }
+                },
+                "required": ["ingredients"]
+            }
+        }
     }
 ]
 
+test_messages = {
+    "recipe": "I have chicken, rice, egg, and onion. What can I cook?",
+    "nutrition": "Estimate the nutrition for chicken, rice, egg, and onion."
+}
 
 messages = [
     {
@@ -104,7 +211,7 @@ messages = [
     {
         # user means: the human’s message/question.
         "role": "user",
-        "content": "I have chicken, rice, egg, and onion. What can I cook?"
+        "content": test_messages["nutrition"]  # Change only this key    
     }
 ]
 
@@ -123,26 +230,34 @@ messages.append(message)
 if message.tool_calls:
     tool_call = message.tool_calls[0]
 
-    if tool_call.function.name == "suggest_recipe":
-        arguments = json.loads(tool_call.function.arguments)
+    arguments = json.loads(tool_call.function.arguments)
 
+    if tool_call.function.name == "suggest_recipe":
         function_result = suggest_recipe(
             ingredients=arguments["ingredients"]
         )
-
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": json.dumps(function_result)
-        })
-
-        # Second call: ask the model to explain the function result
-        final_response = client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=messages
+    elif tool_call.function.name == "estimate_nutrition":
+        function_result = estimate_nutrition(
+            ingredients=arguments["ingredients"]
         )
+    else:
+        function_result = {
+            "error": f"Unknown function: {tool_call.function.name}"
+        }
 
-        print(final_response.choices[0].message.content)
+    messages.append({
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "content": json.dumps(function_result)
+    })
+
+    # Second call: ask the model to explain the function result
+    final_response = client.chat.completions.create(
+        model="deepseek-v4-flash",
+        messages=messages
+    )
+
+    print(final_response.choices[0].message.content)
 
 else:
     print(message.content)
