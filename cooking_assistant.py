@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -14,13 +15,38 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
+
+def create_client():
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+
+    if not api_key:
+        raise ValueError("DEEPSEEK_API_KEY is not configured")
+
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com"
+    )
+
+
+def normalize_ingredients(ingredients):
+    if not isinstance(ingredients, list):
+        raise ValueError("ingredients must be a list")
+
+    normalized = []
+
+    for ingredient in ingredients:
+        if not isinstance(ingredient, str) or not ingredient.strip():
+            raise ValueError("each ingredient must be a non-empty string")
+
+        normalized.append(ingredient.strip().lower())
+
+    return normalized
 
 
 def suggest_recipe(ingredients):
+    normalized_ingredients = normalize_ingredients(ingredients)
+    available_ingredients = set(normalized_ingredients)
+
     recipes = [
         {
             "name": "Chicken Fried Rice",
@@ -49,17 +75,13 @@ def suggest_recipe(ingredients):
     results = []
 
     for recipe in recipes:
-        matched = []
+        required_ingredients = set(recipe["ingredients"])
 
-        for ingredient in ingredients:
-            if ingredient.lower() in recipe["ingredients"]:
-                matched.append(ingredient)
-
-        if len(matched) > 0:
+        if required_ingredients.issubset(available_ingredients):
             results.append({
                 "name": recipe["name"],
                 "time": recipe["time"],
-                "matched_ingredients": matched,
+                "matched_ingredients": recipe["ingredients"],
                 "steps": recipe["steps"]
             })
 
@@ -68,6 +90,8 @@ def suggest_recipe(ingredients):
 
 def estimate_nutrition(ingredients):
     """Estimate nutrition using a typical serving size for each ingredient."""
+    normalized_ingredients = normalize_ingredients(ingredients)
+
     nutrition_data = {
         "chicken": {
             "serving": "100 g cooked chicken breast",
@@ -122,9 +146,8 @@ def estimate_nutrition(ingredients):
         "fat_g": 0
     }
 
-    for ingredient in ingredients:
-        normalized_ingredient = ingredient.strip().lower()
-        nutrition = nutrition_data.get(normalized_ingredient)
+    for ingredient in normalized_ingredients:
+        nutrition = nutrition_data.get(ingredient)
 
         if nutrition is None:
             unknown_ingredients.append(ingredient)
@@ -197,67 +220,141 @@ tools = [
     }
 ]
 
-test_messages = {
-    "recipe": "I have chicken, rice, egg, and onion. What can I cook?",
-    "nutrition": "Estimate the nutrition for chicken, rice, egg, and onion."
+MAX_STEPS = 5
+TOTAL_TIMEOUT_SECONDS = 30
+REQUEST_TIMEOUT_SECONDS = 15
+
+TOOL_FUNCTIONS = {
+    "suggest_recipe": suggest_recipe,
+    "estimate_nutrition": estimate_nutrition,
 }
 
-messages = [
-    {
-        # system means: high-level instruction for how the assistant should behave.
-        "role": "system",
-        "content": "You are a helpful cooking assistant."
-    },
-    {
-        # user means: the human’s message/question.
-        "role": "user",
-        "content": test_messages["nutrition"]  # Change only this key    
-    }
-]
 
-
-# First call: ask the model what to do
-response = client.chat.completions.create(
-    model="deepseek-v4-flash",
-    messages=messages,
-    tools=tools
-)
-
-message = response.choices[0].message
-messages.append(message)
-
-# Check whether the model wants to call a tool
-if message.tool_calls:
-    tool_call = message.tool_calls[0]
-
-    arguments = json.loads(tool_call.function.arguments)
-
-    if tool_call.function.name == "suggest_recipe":
-        function_result = suggest_recipe(
-            ingredients=arguments["ingredients"]
-        )
-    elif tool_call.function.name == "estimate_nutrition":
-        function_result = estimate_nutrition(
-            ingredients=arguments["ingredients"]
-        )
-    else:
-        function_result = {
-            "error": f"Unknown function: {tool_call.function.name}"
+def run_agent(user_input):
+    if not isinstance(user_input, str) or not user_input.strip():
+        return {
+            "status": "error",
+            "error": "User input must be a non-empty string"
         }
 
-    messages.append({
-        "role": "tool",
-        "tool_call_id": tool_call.id,
-        "content": json.dumps(function_result)
-    })
+    try:
+        client = create_client()
+    except Exception as error:
+        return {
+            "status": "error",
+            "error": f"Client setup failed: {error}"
+        }
 
-    # Second call: ask the model to explain the function result
-    final_response = client.chat.completions.create(
-        model="deepseek-v4-flash",
-        messages=messages
-    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful cooking assistant. "
+                "Use tools when useful. Your final response must be valid JSON "
+                'in this format: {"status": "success", "answer": "...", "data": {}}'
+            )
+        },
+        {
+            "role": "user",
+            "content": user_input
+        }
+    ]
 
-    print(final_response.choices[0].message.content)
+    start_time = time.monotonic()
 
-else:
-    print(message.content)
+    for step in range(MAX_STEPS):
+        print(step)
+        elapsed = time.monotonic() - start_time
+        remaining_time = TOTAL_TIMEOUT_SECONDS - elapsed
+
+        if remaining_time <= 0:
+            return {
+                "status": "error",
+                "error": "Agent timed out"
+            }
+
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-v4-flash",
+                messages=messages,
+                tools=tools,
+                response_format={"type": "json_object"},
+                max_tokens=1000,
+                timeout=min(REQUEST_TIMEOUT_SECONDS, remaining_time)
+            )
+        except Exception as error:
+            return {
+                "status": "error",
+                "error": f"Model request failed: {error}"
+            }
+
+        message = response.choices[0].message
+        messages.append(message)
+        print(message)
+
+        # No tool call means the model produced its final JSON answer.
+        if not message.tool_calls:
+            if not message.content:
+                return {
+                    "status": "error",
+                    "error": "Model returned empty content"
+                }
+
+            try:
+                return json.loads(message.content)
+            except json.JSONDecodeError as error:
+                return {
+                    "status": "error",
+                    "error": f"Invalid JSON from model: {error}",
+                    "raw_content": message.content
+                }
+
+        # Execute every tool call, not only tool_calls[0].
+        for tool_call in message.tool_calls:
+            function_name = tool_call.function.name
+
+            try:
+                arguments = json.loads(tool_call.function.arguments)
+
+                if not isinstance(arguments, dict):
+                    raise ValueError("tool arguments must be a JSON object")
+
+                function = TOOL_FUNCTIONS.get(function_name)
+
+                if function is None:
+                    tool_result = {
+                        "error": f"Unknown function: {function_name}"
+                    }
+                else:
+                    tool_result = function(**arguments)
+
+            except json.JSONDecodeError as error:
+                tool_result = {
+                    "error": f"Invalid tool arguments: {error}"
+                }
+            except Exception as error:
+                tool_result = {
+                    "error": f"Tool execution failed: {error}"
+                }
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": json.dumps(tool_result)
+            })
+
+    return {
+        "status": "error",
+        "error": f"Agent exceeded maximum steps ({MAX_STEPS})"
+    }
+
+
+if __name__ == "__main__":
+    # Hello, what can you do?
+    # I have chicken, rice, egg and onion. What can I cook?
+    # Estimate nutrition for chicken and rice.
+    # Suggest a recipe and estimate its nutrition using chicken and rice.
+    
+    user_input = input("You: ")
+    result = run_agent(user_input)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
